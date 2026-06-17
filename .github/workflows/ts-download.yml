@@ -1,7 +1,10 @@
 
 name: ts daily data
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 11 * * *' # daily at 19:00 Beijing time (UTC+8)
 
 permissions:
   contents: read
