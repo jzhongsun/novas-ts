@@ -32,7 +32,7 @@ except ImportError:
 
 
 OUTPUT_DIR = "./output"
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -92,11 +92,12 @@ def _call(fn, **kwargs):
             return fn(**kwargs)
         except Exception as e:
             msg = str(e)
-            if attempt < MAX_RETRIES and ("limit" in msg or "freq" in msg or "抱歉" in msg):
-                wait = 60 * attempt
+            if attempt < MAX_RETRIES:
+                wait = 10 * attempt
                 print(f"  rate-limited, sleeping {wait}s ({attempt}/{MAX_RETRIES})", flush=True)
                 time.sleep(wait)
             else:
+                _log(f"  call {fn.__name__} failed: {msg}")
                 raise
 
 
@@ -161,7 +162,8 @@ def _fetch_day(pro, trade_date: str, with_basic: bool, with_adj: bool, with_st: 
                         "turnover_rate", "dv_ratio", "circ_mv", "total_mv"]
                 vb = vb[[c for c in keep if c in vb.columns]]
                 basic_df = vb
-        except Exception:
+        except Exception as err:
+            _log(f"  daily_basic {trade_date} failed: {err}")
             pass
 
     if with_adj:
@@ -169,7 +171,8 @@ def _fetch_day(pro, trade_date: str, with_basic: bool, with_adj: bool, with_st: 
             af = _call(pro.adj_factor, trade_date=trade_date)
             if af is not None and not af.empty:
                 adj_df = af
-        except Exception:
+        except Exception as err:
+            _log(f"  adj_factor {trade_date} failed: {err}")
             pass
 
     if with_st:
@@ -180,7 +183,8 @@ def _fetch_day(pro, trade_date: str, with_basic: bool, with_adj: bool, with_st: 
             st = _call(pro.stock_st, trade_date=trade_date)
             if st is not None and not st.empty:
                 st_df = st
-        except Exception:
+        except Exception as err:
+            _log(f"  stock_st {trade_date} failed: {err}")
             pass
 
     return daily_df, basic_df, adj_df, st_df
@@ -237,7 +241,7 @@ def _process_month(
             need_refetch = True
         if with_basic and existing_basic.empty:
             need_refetch = True
-        if with_st and existing_st.empty:
+        if with_st and existing_st.empty and yyyymm >= "201601":
             need_refetch = True
     if need_refetch:
         reason = "forced" if force else "missing requested side data"
@@ -559,6 +563,31 @@ def download_sw_daily(
 
 # ── dataset builder (tushare native, inline adj_factor) ──────────────────────
 
+def _to_code(ts_code) -> str:
+    """tushare ts_code '000001.SZ' -> 'SZ000001' (market prefix + 6-digit code)."""
+    parts = str(ts_code).split(".")
+    if len(parts) == 2:
+        return f"{parts[1]}{parts[0]}".upper()
+    return str(ts_code).upper()
+
+
+def _load_kind(kline_dir: str, kind: str, months: list[str]) -> pd.DataFrame | None:
+    """Load all existing monthly parquet files for a kline kind within `months`.
+
+    Returns None if no file exists (caller degrades gracefully — missing source).
+    """
+    spec = next((k for k in _KLINE_KINDS if k["kind"] == kind), None)
+    if spec is None:
+        return None
+    sub = Path(kline_dir) / spec["subdir"]
+    files = [sub / f"{spec['prefix']}-{m}.parquet" for m in months]
+    files = [f for f in files if f.exists()]
+    if not files:
+        return None
+    return pd.concat(
+        (pd.read_parquet(f, engine="pyarrow") for f in files), ignore_index=True)
+
+
 def _apply_adjust(df: pd.DataFrame, mode: str) -> pd.DataFrame:
     """Apply proportional adjustment using inline adj_factor.
 
@@ -570,8 +599,8 @@ def _apply_adjust(df: pd.DataFrame, mode: str) -> pd.DataFrame:
         return df
 
     parts = []
-    for _, g in df.groupby("ts_code", sort=False):
-        g = g.sort_values("trade_date")
+    for _, g in df.groupby("code", sort=False):
+        g = g.sort_values("date")
         f = pd.to_numeric(g["adj_factor"], errors="coerce").ffill().fillna(1.0).values
         ref = f[-1] if mode == "fore" else f[0]
         if not ref or pd.isna(ref):
@@ -579,9 +608,9 @@ def _apply_adjust(df: pd.DataFrame, mode: str) -> pd.DataFrame:
         ratio = (f / ref).astype("float32")
         for col in ("open", "high", "low", "close", "pre_close"):
             if col in g.columns:
-                g[col] = (pd.to_numeric(g[col], errors="coerce").astype("float32") * ratio).round(4)
-        if "vol" in g.columns:
-            g["vol"] = (pd.to_numeric(g["vol"], errors="coerce").astype("float32") / ratio).round(2)
+                g[col] = pd.to_numeric(g[col], errors="coerce").astype("float32") * ratio
+        if "volume" in g.columns:
+            g["volume"] = pd.to_numeric(g["volume"], errors="coerce").astype("float32") / ratio
         parts.append(g)
     return pd.concat(parts, ignore_index=True)
 
@@ -595,59 +624,124 @@ def build_dataset(
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> pd.DataFrame:
-    """Build clean tushare-native dataset from monthly files (adj_factor inline).
+    """Build a standard wide dataset from the four per-month sources.
 
-    No separate adjust merge needed — adj_factor is a column in the month files.
+    Merges daily + daily_basic + adj_factor + stock_st into one row per
+    (stock, trade_date). Field naming aligns with baostock
+    `normalize_klines_df` (code/date/volume/change_pct/pb_mrq/is_st...).
+
+    Units (aligned to baostock): volume in shares (vol手×100), amount in yuan
+    (千元×1000); turnover_rate/dv_ratio/change_pct in %; cap (流通市值) and
+    total_mv (总市值) in 万元.
     """
-    files = sorted(Path(kline_dir).glob("stock-day-*.parquet"))
-    if not files:
-        raise FileNotFoundError(f"No stock-day-*.parquet in {kline_dir}")
+    # ── 1. month set (driven by daily, the primary source) ────────────────────
+    s_ym = int(str(start_date).replace("-", "")[:6]) if start_date else 0
+    e_ym = int(str(end_date).replace("-", "")[:6]) if end_date else 999999
+    daily_sub = Path(kline_dir) / "daily"
+    months = sorted({
+        f.stem.split("-")[-1] for f in daily_sub.glob("daily-*.parquet")
+        if s_ym <= int(f.stem.split("-")[-1]) <= e_ym
+    })
+    if not months:
+        raise FileNotFoundError(f"No daily/daily-*.parquet in {kline_dir}")
 
-    if start_date or end_date:
-        s = int(str(start_date).replace("-", "")[:6]) if start_date else 0
-        e = int(str(end_date).replace("-", "")[:6]) if end_date else 999999
-        files = [f for f in files if s <= int(f.stem.split("-")[-1]) <= e]
+    # ── 2. load four sources (degrade gracefully when a source is absent) ─────
+    daily = _load_kind(kline_dir, "daily", months)           # required (non-None)
+    basic = _load_kind(kline_dir, "daily_basic", months)     # may be None
+    adj = _load_kind(kline_dir, "adj_factor", months)        # may be None
+    st = _load_kind(kline_dir, "st", months)                 # may be None
+    _log(f"dataset: months={len(months)} daily={len(daily)} basic={len(basic) if basic is not None else 'NA'} "
+         f"adj={len(adj) if adj is not None else 'NA'} st={len(st) if st is not None else 'NA'}")
 
-    print(f"Loading {len(files)} monthly files ...")
-    df = pd.concat(pd.read_parquet(f, engine="pyarrow") for f in files).reset_index(drop=True)
-    print(f"Loaded: rows={len(df)}, stocks={df['ts_code'].nunique()}")
+    # ── 3. merge (pre-rename, on raw ts_code + trade_date) ────────────────────
+    keys = ["ts_code", "trade_date"]
+    df = daily.copy()
+    if basic is not None:
+        df = df.merge(basic, on=keys, how="left")
+    if adj is not None:
+        df = df.merge(adj[keys + ["adj_factor"]], on=keys, how="left")
 
-    if start_date:
-        df = df[df["trade_date"].astype(str) >= str(start_date).replace("-", "")]
-    if end_date:
-        df = df[df["trade_date"].astype(str) <= str(end_date).replace("-", "")]
+    # ── 4. is_st from per-day stock_st (sparse); default 0 when absent ────────
+    if st is not None:
+        st_flag = st[keys].drop_duplicates()
+        st_flag["is_st"] = 1
+        df = df.merge(st_flag, on=keys, how="left")
+        df["is_st"] = df["is_st"].fillna(0)
+    else:
+        df["is_st"] = 0
+
+    # ── 5. row-level date filter (string compare on raw trade_date) ───────────
+    s = str(start_date).replace("-", "") if start_date else None
+    e = str(end_date).replace("-", "") if end_date else None
+    if s:
+        df = df[df["trade_date"].astype(str) >= s]
+    if e:
+        df = df[df["trade_date"].astype(str) <= e]
     if df.empty:
         raise RuntimeError("No data after date filter")
 
-    if adjust in ("fore", "back"):
-        if "adj_factor" not in df.columns:
-            raise RuntimeError("adj_factor column missing — re-run klines with adj enabled")
-        print(f"Applying {adjust} adjustment ...")
-        df = _apply_adjust(df, mode=adjust)
-        df["change"] = pd.to_numeric(df["close"], errors="coerce") - pd.to_numeric(df["pre_close"], errors="coerce")
-        df.loc[df["pre_close"] > 0, "pct_chg"] = (df["close"] / df["pre_close"] - 1) * 100
+    # ── 6. rename + unit conversion + types ───────────────────────────────────
+    parts = df["ts_code"].astype(str).str.split(".")
+    df["code"] = (parts.str[1] + parts.str[0]).str.upper()        # 000001.SZ -> SZ000001
+    df["date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce")
+    df = df.rename(columns={"vol": "volume", "pb": "pb_mrq", "pct_chg": "change_pct", "circ_mv": "cap"})
+    drop_cols = [c for c in ("ts_code", "trade_date") if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
 
+    for c in ("open", "high", "low", "close", "pre_close", "change", "change_pct"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
+    if "volume" in df.columns:
+        df["volume"] = (pd.to_numeric(df["volume"], errors="coerce").astype("float32") * 100.0)  # 手 -> 股
+    if "amount" in df.columns:
+        df["amount"] = (pd.to_numeric(df["amount"], errors="coerce").astype("float32") * 1000.0)  # 千元 -> 元
+    for c in ("pe_ttm", "pb_mrq", "ps_ttm", "turnover_rate", "dv_ratio", "cap", "total_mv", "adj_factor"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
+    df["is_st"] = pd.to_numeric(df["is_st"], errors="coerce").fillna(0).astype("int8")
+
+    # ── 7. drop rows with unparseable date ────────────────────────────────────
+    df = df.dropna(subset=["date"]).copy()
+
+    # ── 8. adjust (fore/back); recompute change/change_pct afterwards ─────────
+    if adjust in ("fore", "back"):
+        if "adj_factor" not in df.columns or df["adj_factor"].isna().all():
+            raise RuntimeError("adj_factor missing — re-run klines with --adj")
+        _log(f"dataset: applying {adjust} adjustment")
+        df = _apply_adjust(df, mode=adjust)
+        # ── 9. recompute change/change_pct (prices changed by adjustment) ─────
+        df["change"] = (pd.to_numeric(df["close"], errors="coerce")
+                        - pd.to_numeric(df["pre_close"], errors="coerce")).astype("float32")
+        df["change_pct"] = ((df["close"].astype("float32") / df["pre_close"].astype("float32") - 1.0) * 100.0)
+        df.loc[df["pre_close"] <= 0, "change_pct"] = float("nan")
+    # non-adjusted: keep tushare's original change/change_pct (already renamed)
+
+    # ── 10. drop_ipo_days (code -> list_date map from stock_basic) ────────────
     if drop_ipo_days > 0 and Path(basic_path).exists():
-        basic = pd.read_parquet(basic_path, engine="pyarrow")
-        ipo_map = dict(zip(basic["ts_code"], basic["list_date"]))
-        df = df.sort_values(["ts_code", "trade_date"])
-        df["_rank"] = df.groupby("ts_code").cumcount()
-        df["_ipo"] = df["ts_code"].map(ipo_map)
-        first_dt = pd.to_datetime(df.groupby("ts_code")["trade_date"].transform("first"), format="%Y%m%d")
-        ipo_dt = pd.to_datetime(df["_ipo"].fillna("19000101"), format="%Y%m%d", errors="coerce")
+        basic_info = pd.read_parquet(basic_path, engine="pyarrow")
+        bp = basic_info["ts_code"].astype(str).str.split(".")
+        basic_code = (bp.str[1] + bp.str[0]).str.upper()
+        ipo_map = dict(zip(basic_code, basic_info["list_date"]))
+        df = df.sort_values(["code", "date"])
+        df["_rank"] = df.groupby("code").cumcount()
+        df["_ipo"] = df["code"].map(ipo_map)
+        first_dt = df.groupby("code")["date"].transform("first")
+        ipo_dt = pd.to_datetime(df["_ipo"].fillna("19000101").astype(str), format="%Y%m%d", errors="coerce")
         is_ipo_adj = df["_ipo"].notna() & ((first_dt - ipo_dt).dt.days <= 60)
         df = df[~(is_ipo_adj & (df["_rank"] < drop_ipo_days))]
         df = df.drop(columns=["_rank", "_ipo"])
 
-    if remove_st and Path(basic_path).exists():
-        basic = pd.read_parquet(basic_path, engine="pyarrow")
-        st_codes = set(basic.loc[basic["name"].astype(str).str.contains("ST", na=False), "ts_code"])
+    # ── 11. remove_st: per-day precise (drop only is_st==1 rows) ──────────────
+    if remove_st:
         before = len(df)
-        df = df[~df["ts_code"].isin(st_codes)]
-        print(f"Removed ST rows: {before} → {len(df)}")
+        df = df[df["is_st"] == 0]
+        _log(f"dataset: removed ST rows {before} -> {len(df)}")
 
-    df = df.sort_values(["trade_date", "ts_code"]).reset_index(drop=True)
-    print(f"Dataset ready: rows={len(df)}, stocks={df['ts_code'].nunique()}")
+    # ── 12. volume>0 filter + sort ────────────────────────────────────────────
+    df = df[df["volume"] > 0]
+    df = df.sort_values(["code", "date"]).reset_index(drop=True)
+    _log(f"dataset ready: rows={len(df)}, stocks={df['code'].nunique()}")
     return df
 
 
@@ -842,6 +936,83 @@ def download_sw_members(
     return df
 
 
+def build_industry_mapping(
+    classify_df: pd.DataFrame,
+    members_df: pd.DataFrame,
+    daily_dir: str = "output/sw_daily",
+) -> pd.DataFrame:
+    """Build stock -> effective SW industry index mapping from in-memory frames.
+
+    Each stock's L3 industry is used if it has a published index (is_pub='1');
+    otherwise falls back to L2, then L1 (L1 always has indices). This gives
+    every stock a valid industry index to join against sw_daily, even for the
+    ~97 SW industries whose indices are unpublished (constituents < 5).
+
+    Args:
+        classify_df: sw_classify frame (index_code/industry_name/level/is_pub).
+        members_df: sw_members frame (l1/l2/l3_code, ts_code, is_new, in/out_date).
+        daily_dir: sw_daily dir to flag which effective indices have data (has_daily).
+
+    Output columns:
+      code (SZ000001, aligns with build_dataset), ts_code,
+      l1_code/l1_name, l2_code/l2_name, l3_code/l3_name (original 3-level),
+      effective_industry_code (.SI), effective_industry_name, effective_level,
+      has_daily (whether sw_daily actually has data for the effective index),
+      in_date, out_date
+    """
+    classify = classify_df
+    members = members_df
+
+    # current constituents only; one row per stock
+    cur = members[members["is_new"].astype(str).str.upper() == "Y"].copy()
+    cur = cur.drop_duplicates(subset=["ts_code"]).reset_index(drop=True)
+
+    # published index set + name lookup
+    pub = classify[classify["is_pub"].astype(str) == "1"]
+    pub_codes = set(pub["index_code"].astype(str))
+    name_map = dict(zip(classify["index_code"].astype(str), classify["industry_name"]))
+
+    # which effective indices actually have sw_daily data locally
+    daily_codes: set[str] = set()
+    ddir = Path(daily_dir)
+    if ddir.exists():
+        for f in ddir.glob("sw_daily-*.parquet"):
+            daily_codes |= set(pd.read_parquet(f, columns=["ts_code"])["ts_code"].astype(str))
+
+    # L3 -> L2 -> L1 fallback
+    def _fallback(l3, l2, l1):
+        for code, lvl in ((l3, "L3"), (l2, "L2"), (l1, "L1")):
+            if pd.notna(code) and str(code) in pub_codes:
+                return str(code), lvl
+        return None, None
+
+    eff = cur.apply(
+        lambda r: _fallback(r.get("l3_code"), r.get("l2_code"), r.get("l1_code")),
+        axis=1, result_type="expand",
+    )
+    cur["effective_industry_code"] = eff[0]
+    cur["effective_level"] = eff[1]
+    cur["effective_industry_name"] = cur["effective_industry_code"].map(name_map)
+    cur["has_daily"] = cur["effective_industry_code"].isin(daily_codes)
+
+    # stock code aligned with build_dataset (000001.SZ -> SZ000001)
+    cur["code"] = cur["ts_code"].apply(_to_code)
+
+    out_cols = [
+        "code", "ts_code",
+        "l1_code", "l1_name", "l2_code", "l2_name", "l3_code", "l3_name",
+        "effective_industry_code", "effective_industry_name", "effective_level",
+        "has_daily", "in_date", "out_date",
+    ]
+    out = cur[[c for c in out_cols if c in cur.columns]].copy()
+
+    lvl = out["effective_level"].value_counts().to_dict()
+    _log(f"sw_mapping: {len(out)} stocks, effective_level={lvl}, "
+         f"has_daily={int(out['has_daily'].sum())}/{len(out)}, "
+         f"None={int(out['effective_industry_code'].isna().sum())}")
+    return out
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def _upload(args):
@@ -944,8 +1115,15 @@ def _cmd_sw(args):
 def _cmd_sw_classify(args):
     classify_df = download_sw_classify(src=args.src)
     if not args.no_members:
-        download_sw_members(src=args.src, is_new=args.is_new, classify_df=classify_df)
-        args.allow_patterns = ["sw_classify.parquet", "sw_members.parquet"]
+        members_df = download_sw_members(src=args.src, is_new=args.is_new, classify_df=classify_df)
+        # stock -> effective industry index (L3->L2->L1 fallback for unpublished L3)
+        mapping = build_industry_mapping(classify_df, members_df)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        mapping.to_parquet(os.path.join(OUTPUT_DIR, "sw_industry_mapping.parquet"),
+                           index=False, engine="pyarrow")
+        _log("sw_classify: saved sw_industry_mapping.parquet")
+        args.allow_patterns = ["sw_classify.parquet", "sw_members.parquet",
+                               "sw_industry_mapping.parquet"]
     if args.upload:
         _upload(args)
 
@@ -1021,7 +1199,7 @@ def main():
     p.add_argument("--repo-id", default="", help="ModelScope repo (required if --upload)")
     p.set_defaults(func=_cmd_sw)
 
-    p = sub.add_parser("sw-classify", help="Shenwan industry classification (pro.index_classify) + members")
+    p = sub.add_parser("sw-classify", help="Shenwan classification + members + stock->industry mapping")
     p.add_argument("--src", default="SW2021", choices=["SW2021", "SW2014"],
                    help="Classification version (SWS2021 default, or SWS2014)")
     p.add_argument("--no-members", action="store_true",
@@ -1032,7 +1210,8 @@ def main():
     p.set_defaults(func=_cmd_sw_classify)
 
     p = sub.add_parser("dataset", help="Build clean dataset (adj_factor inline)")
-    p.add_argument("--kline-dir", default=OUTPUT_DIR)
+    p.add_argument("--kline-dir", default=OUTPUT_DIR,
+                   help="Output root dir (contains daily/ daily_basic/ adj_factor/ stock_st/ subdirs)")
     p.add_argument("--basic-path", default="output/stock_basic.parquet")
     p.add_argument("--adjust", default="none", choices=["none", "fore", "back"])
     p.add_argument("--keep-st", action="store_true")
