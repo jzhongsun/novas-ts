@@ -34,7 +34,9 @@ jobs:
 
         LAST_DAY=$(date -d "$NEXT_MONTH_FIRST -1 day" +%Y%m%d)
         python ts.py basic
-        python ts.py klines --start-date=$FIRST_DAY  --end-date=$LAST_DAY --workers=1
+        python ts.py klines --start-date=$FIRST_DAY --workers=4
+        python ts.py sw-classify
+        python ts.py sw --start-date=$FIRST_DAY --workers=4
       env:
         TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
         TUSHARE_BASEURL: ${{ secrets.TUSHARE_BASEURL }}
