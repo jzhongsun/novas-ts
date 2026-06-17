@@ -40,3 +40,4 @@ jobs:
       env:
         TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
         TUSHARE_BASEURL: ${{ secrets.TUSHARE_BASEURL }}
+        MODELSCOPE_ACCESS_TOKEN: ${{ secrets.MODELSCOPE_ACCESS_TOKEN }}
