@@ -24,7 +24,7 @@ jobs:
       run: |
         YEAR=$(date +%Y)
         MONTH=$(date +%m)
-        FIRST_DAY="${YEAR}-${MONTH}-01"
+        FIRST_DAY="${YEAR}${MONTH}01"
 
         if [ $MONTH -eq 12 ]; then
             NEXT_MONTH_FIRST="${YEAR}-$((YEAR+1))-01-01"
@@ -32,7 +32,7 @@ jobs:
             NEXT_MONTH_FIRST="${YEAR}-$(printf "%02d" $((10#$MONTH + 1)))-01"
         fi
 
-        LAST_DAY=$(date -d "$NEXT_MONTH_FIRST -1 day" +%Y-%m-%d)
+        LAST_DAY=$(date -d "$NEXT_MONTH_FIRST -1 day" +%Y%m%d)
         python ts.py basic
         python ts.py klines --start-date=$FIRST_DAY  --end-date=$LAST_DAY --workers=1
       env:
