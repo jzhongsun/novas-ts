@@ -64,9 +64,10 @@ def _pro():
         token = os.environ.get("TUSHARE_TOKEN", "")
         if not token:
             raise RuntimeError("Set TUSHARE_TOKEN env var (https://tushare.pro)")
+        base_url = os.environ.get("TUSHARE_BASEURL", "")
+        _log(f"tushare: initializing pro_api (base_url={'custom' if base_url else 'default'})")
         ts.set_token(token)
         _PRO = ts.pro_api()
-        base_url = os.environ.get("TUSHARE_BASEURL", "")
         if base_url:
             _PRO._DataApi__http_url = base_url
     return _PRO
@@ -76,6 +77,12 @@ def _fmt_date(d) -> str:
     """20180726 -> 2018-07-26."""
     s = str(d)
     return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+
+
+def _log(msg: str) -> None:
+    """Timestamped one-line log to stdout (flushed). For milestone/summary lines."""
+    from datetime import datetime
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
 def _call(fn, **kwargs):
@@ -108,20 +115,28 @@ def fetch_stock_basic() -> pd.DataFrame:
         try:
             df = _call(pro.stock_basic, exchange="", list_status=status, fields=fields)
             if df is not None and not df.empty:
+                _log(f"stock_basic list_status={status}: {len(df)} rows")
                 frames.append(df)
         except Exception:
             pass
     if not frames:
         return pd.DataFrame()
     df = pd.concat(frames, ignore_index=True)
-    return df.drop_duplicates(subset=["ts_code"], keep="last").reset_index(drop=True)
+    df = df.drop_duplicates(subset=["ts_code"], keep="last").reset_index(drop=True)
+    _log(f"stock_basic: {len(df)} unique stocks")
+    return df
 
 
 def fetch_calendar_dates(start_date: str, end_date: str) -> pd.DataFrame:
     """SSE/SZSE trade calendar. start/end as YYYYMMDD."""
     pro = _pro()
     df = _call(pro.trade_cal, exchange="SSE", start_date=start_date, end_date=end_date)
-    return df if df is not None else pd.DataFrame()
+    if df is None or df.empty:
+        _log(f"trade_cal {start_date}~{end_date}: empty")
+        return pd.DataFrame()
+    n_open = int((df["is_open"] == 1).sum()) if "is_open" in df.columns else 0
+    _log(f"trade_cal {start_date}~{end_date}: {len(df)} rows, {n_open} open days")
+    return df
 
 
 # ── per-day fetch + per-month store ──────────────────────────────────────────
@@ -211,6 +226,10 @@ def _process_month(
     existing_adj = _load(adj_month_file)
     existing_st = _load(st_month_file)
 
+    _log(f"[{yyyymm}] start: existing daily={len(existing_daily)} basic={len(existing_basic)} "
+         f"adj={len(existing_adj)} st={len(existing_st)} rows; days={len(days)} "
+         f"basic={with_basic} adj={with_adj} st={with_st}")
+
     # If requested side data is absent from existing files, refetch the whole month.
     need_refetch = force
     if not existing_daily.empty:
@@ -220,6 +239,9 @@ def _process_month(
             need_refetch = True
         if with_st and existing_st.empty:
             need_refetch = True
+    if need_refetch:
+        reason = "forced" if force else "missing requested side data"
+        _log(f"[{yyyymm}] full-month refetch ({reason})")
 
     if need_refetch or existing_daily.empty:
         present: set[str] = set()
@@ -228,8 +250,9 @@ def _process_month(
 
     missing = [d for d in days if str(d) not in present]
     if not missing:
-        print(f"[{yyyymm}] up to date ({len(days)} days)", flush=True)
+        _log(f"[{yyyymm}] up to date ({len(days)} days)")
         return 0
+    _log(f"[{yyyymm}] {len(missing)}/{len(days)} days to fetch (workers={workers})")
 
     new_daily: list[pd.DataFrame] = []
     new_basic: list[pd.DataFrame] = []
@@ -274,7 +297,12 @@ def _process_month(
                 print(f"[{yyyymm}] {i}/{n} days fetched", flush=True)
 
     if not new_daily:
+        _log(f"[{yyyymm}] no daily rows fetched (all days empty/failed)")
         return 0
+
+    _log(f"[{yyyymm}] fetched new daily={sum(len(f) for f in new_daily)} "
+         f"basic={sum(len(f) for f in new_basic)} adj={sum(len(f) for f in new_adj)} "
+         f"st={sum(len(f) for f in new_st)} rows")
 
     def _merge(existing: pd.DataFrame, frames: list[pd.DataFrame]) -> pd.DataFrame:
         """Concat existing + new, dedup by (ts_code, trade_date), sort."""
@@ -377,9 +405,9 @@ def download_all_stocks_klines(
         by_month.setdefault(d[:6], []).append(d)
     months = sorted(by_month.items())
 
-    print(f"Months: {len(months)}, trade days: {len(days)}, "
-          f"workers: {workers}, force: {force}, basic: {with_basic}, "
-          f"adj: {with_adj}, st: {with_st}")
+    _log(f"klines: {len(months)} months, {len(days)} trade days, "
+         f"workers={workers}, force={force}, basic={with_basic}, "
+         f"adj={with_adj}, st={with_st}")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -390,7 +418,7 @@ def download_all_stocks_klines(
         total_new += _process_month(
             m, mdays, OUTPUT_DIR, with_basic, with_adj, force, workers, with_st)
 
-    print(f"Done: {total_new} new day-records across {len(months)} months")
+    _log(f"klines done: {total_new} new day-records across {len(months)} months")
     return _kline_uploads(OUTPUT_DIR, with_basic, with_adj, with_st)
 
 
@@ -432,6 +460,9 @@ def _process_sw_month(
         except Exception:
             existing = pd.DataFrame()
 
+    _log(f"[sw {yyyymm}] start: existing={len(existing)} rows; days={len(days)} "
+         f"force={force}")
+
     if force or existing.empty:
         present: set[str] = set()
     else:
@@ -439,8 +470,9 @@ def _process_sw_month(
 
     missing = [d for d in days if str(d) not in present]
     if not missing:
-        print(f"[{yyyymm}] up to date ({len(days)} days)", flush=True)
+        _log(f"[sw {yyyymm}] up to date ({len(days)} days)")
         return 0
+    _log(f"[sw {yyyymm}] {len(missing)}/{len(days)} days to fetch (workers={workers})")
 
     frames: list[pd.DataFrame] = []
     n = len(missing)
@@ -465,6 +497,7 @@ def _process_sw_month(
                 print(f"[{yyyymm}] {i}/{n} days fetched", flush=True)
 
     if not frames:
+        _log(f"[sw {yyyymm}] no rows fetched (all days empty/failed)")
         return 0
 
     new = pd.concat(frames, ignore_index=True)
@@ -474,7 +507,7 @@ def _process_sw_month(
 
     month_file.parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(month_file, index=False, engine="pyarrow")
-    print(f"[{yyyymm}] saved {len(combined)} rows ({len(missing)} new days)", flush=True)
+    _log(f"[sw {yyyymm}] saved {len(combined)} rows ({len(new)} new, {len(missing)} days)")
     return len(new)
 
 
@@ -515,7 +548,7 @@ def download_sw_daily(
     for yyyymm, mdays in months:
         total_new += _process_sw_month(pro, yyyymm, mdays, sw_dir, force, workers)
 
-    print(f"Done: {total_new} new sw_daily rows across {len(months)} months")
+    _log(f"sw_daily done: {total_new} new rows across {len(months)} months")
     return [{
         "kind": "sw_daily",
         "local_dir": str(sw_dir),
@@ -659,13 +692,14 @@ def download_forecast_reports(start_date: str, end_date: str) -> pd.DataFrame:
             q, y = 1, y + 1
 
     pro = _pro()
-    print(f"Fetching {len(periods)} report periods")
+    _log(f"forecast: fetching {len(periods)} report periods")
     frames = []
     for p in periods:
         try:
             df = _call(pro.forecast, period=p)
             if df is not None and not df.empty:
                 frames.append(df)
+                _log(f"  forecast period {p}: {len(df)} rows")
         except Exception as e:
             print(f"  period {p} failed: {e}")
     if not frames:
@@ -674,7 +708,7 @@ def download_forecast_reports(start_date: str, end_date: str) -> pd.DataFrame:
     merged = pd.concat(frames, ignore_index=True)
     out = os.path.join(OUTPUT_DIR, "forecast_reports.parquet")
     merged.to_parquet(out, index=False, engine="pyarrow")
-    print(f"Saved: {out}, rows={len(merged)}")
+    _log(f"forecast: saved {out}, rows={len(merged)}")
     return merged
 
 
@@ -684,7 +718,7 @@ def download_index_component_klines(index_code: str, start_date: str, end_date: 
     if iw is None or iw.empty:
         raise RuntimeError(f"No constituents for {index_code}")
     codes = iw["con_code"].drop_duplicates().tolist()
-    print(f"Constituents: {len(codes)}")
+    _log(f"index {index_code}: {len(codes)} constituents, {start_date}~{end_date}")
 
     frames = []
     for i, c in enumerate(codes, start=1):
@@ -705,7 +739,7 @@ def download_index_component_klines(index_code: str, start_date: str, end_date: 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out = os.path.join(OUTPUT_DIR, "index_component_klines.parquet")
     merged.to_parquet(out, index=False, engine="pyarrow")
-    print(f"Saved: {out}, rows={len(merged)}, stocks={merged['ts_code'].nunique()}")
+    _log(f"index {index_code}: saved {out}, rows={len(merged)}, stocks={merged['ts_code'].nunique()}")
     return merged
 
 
@@ -721,9 +755,12 @@ def fetch_sw_classify(src: str = "SW2021") -> pd.DataFrame:
         df = _call(pro.index_classify, src=src)
         if df is not None and not df.empty:
             frames.append(df)
+            lvl_counts = df["level"].value_counts().to_dict() if "level" in df.columns else {}
+            _log(f"index_classify {src}: {len(df)} rows, levels={lvl_counts}")
     except Exception as e:
         print(f"  index_classify {src} failed: {e}")
     if not frames:
+        _log(f"index_classify {src}: empty")
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True).drop_duplicates()
 
@@ -739,7 +776,7 @@ def download_sw_classify(src: str = "SW2021") -> pd.DataFrame:
         raise RuntimeError("Failed to fetch sw classify")
     out = os.path.join(OUTPUT_DIR, "sw_classify.parquet")
     df.to_parquet(out, index=False, engine="pyarrow")
-    print(f"Saved: {out}, rows={len(df)}")
+    _log(f"sw_classify: saved {out}, rows={len(df)}")
     return df
 
 
@@ -768,10 +805,11 @@ def fetch_sw_members(l1_codes: list[str], is_new: str = "Y") -> pd.DataFrame:
             df = _call(pro.index_member_all, l1_code=code, is_new=is_new)
             if df is not None and not df.empty:
                 frames.append(df)
+                _log(f"  members l1={code}: {len(df)} rows ({i}/{n})")
+            else:
+                _log(f"  members l1={code}: empty ({i}/{n})")
         except Exception as e:
             print(f"  index_member_all l1_code={code} failed: {e}")
-        if i % 5 == 0 or i == n:
-            print(f"  members {i}/{n} L1 industries fetched", flush=True)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True).drop_duplicates()
@@ -793,14 +831,14 @@ def download_sw_members(
     l1_codes = _sw_l1_codes(classify_df)
     if not l1_codes:
         raise RuntimeError("No L1 industry codes found in sw_classify")
-    print(f"Fetching members for {len(l1_codes)} L1 industries (is_new={is_new})")
+    _log(f"sw_members: fetching {len(l1_codes)} L1 industries (is_new={is_new})")
     df = fetch_sw_members(l1_codes, is_new=is_new)
     if df.empty:
         raise RuntimeError("Failed to fetch sw members")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out = os.path.join(OUTPUT_DIR, "sw_members.parquet")
     df.to_parquet(out, index=False, engine="pyarrow")
-    print(f"Saved: {out}, rows={len(df)}, stocks={df['ts_code'].nunique()}")
+    _log(f"sw_members: saved {out}, rows={len(df)}, stocks={df['ts_code'].nunique()}")
     return df
 
 
