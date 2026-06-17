@@ -1,0 +1,39 @@
+
+name: ts daily data
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: |
+        pip install tushare pyarrow modelscope
+    - name: Download ts data
+      run: |
+        YEAR=$(date +%Y)
+        MONTH=$(date +%m)
+        FIRST_DAY="${YEAR}-${MONTH}-01"
+
+        if [ $MONTH -eq 12 ]; then
+            NEXT_MONTH_FIRST="${YEAR}-$((YEAR+1))-01-01"
+        else
+            NEXT_MONTH_FIRST="${YEAR}-$(printf "%02d" $((10#$MONTH + 1)))-01"
+        fi
+
+        LAST_DAY=$(date -d "$NEXT_MONTH_FIRST -1 day" +%Y-%m-%d)
+        python ts.py basic
+        python ts.py klines --start-date=$FIRST_DAY  --end-date=$LAST_DAY --workers=1
+    #   env:
+    #     MODELSCOPE_ACCESS_TOKEN: ${{ secrets.MS_TOKEN }}
