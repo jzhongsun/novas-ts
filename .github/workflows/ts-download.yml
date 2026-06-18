@@ -37,9 +37,10 @@ jobs:
 
         LAST_DAY=$(date -d "$NEXT_MONTH_FIRST -1 day" +%Y%m%d)
         python ts.py basic --upload --repo-id=jzhongsun/novas-data-ts
-        python ts.py klines --start-date=$FIRST_DAY --upload --repo-id=jzhongsun/novas-data-ts --workers=2
+        python ts.py klines --start-date=$FIRST_DAY --upload --repo-id=jzhongsun/novas-data-ts --workers=1
         python ts.py sw-classify --upload --repo-id=jzhongsun/novas-data-ts
-        python ts.py sw --start-date=$FIRST_DAY --workers=2 --upload --repo-id=jzhongsun/novas-data-ts
+        python ts.py sw --start-date=$FIRST_DAY --upload --repo-id=jzhongsun/novas-data-ts --workers=1
+        python ts.py dataset --adjust=back --upload --repo-id=jzhongsun/novas-ds
       env:
         TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
         TUSHARE_BASEURL: ${{ secrets.TUSHARE_BASEURL }}

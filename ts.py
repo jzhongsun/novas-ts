@@ -22,6 +22,7 @@ import argparse
 import os
 import time
 from pathlib import Path
+from typing import Iterator
 
 import pandas as pd
 
@@ -589,11 +590,13 @@ def _load_kind(kline_dir: str, kind: str, months: list[str]) -> pd.DataFrame | N
 
 
 def _apply_adjust(df: pd.DataFrame, mode: str) -> pd.DataFrame:
-    """Apply proportional adjustment using inline adj_factor.
+    """Apply price/volume adjustment using tushare adj_factor (vectorized).
 
-      fore (前复权): ratio = adj_factor(t) / adj_factor(latest)
-      back (后复权): ratio = adj_factor(t) / adj_factor(earliest)
-    price × ratio ; volume / ratio ; amount unchanged.
+    tushare adj_factor is itself the back-adjust coefficient (anchored at the
+    listing day, where adj_factor == 1), so no ratio/ref bookkeeping needed:
+      back (后复权): price × adj_factor ; volume / adj_factor
+      fore (前复权): price × adj_factor / adj_factor_latest ; volume inverse
+    amount is unchanged (price × volume conserved).
     """
     if "adj_factor" not in df.columns:
         return df
@@ -615,8 +618,9 @@ def _apply_adjust(df: pd.DataFrame, mode: str) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
-def build_dataset(
-    kline_dir: str = OUTPUT_DIR,
+def build_stock_dataset(
+    kline_dir: str,
+    months: list[str],
     basic_path: str = "output/stock_basic.parquet",
     adjust: str = "none",
     remove_st: bool = True,
@@ -886,17 +890,20 @@ def _sw_l1_codes(classify_df: pd.DataFrame) -> list[str]:
     return codes
 
 
-def fetch_sw_members(l1_codes: list[str], is_new: str = "Y") -> pd.DataFrame:
-    """Fetch Shenwan index members (pro.index_member_all) for each L1 industry code.
+def fetch_sw_members(l1_codes: list[str]) -> pd.DataFrame:
+    """Fetch Shenwan index members (pro.index_member_all) for each L1 industry.
 
-    A single L1 industry's current members are well under the 2000-row cap.
+    Fetches ALL membership records (incl. historical in/out via in_date/out_date)
+    so the mapping can derive current membership from out_date. is_new is a
+    classification-version tag (not a snapshot) and is not used for filtering.
+    A single L1's records are well under the 2000-row cap.
     """
     pro = _pro()
     frames = []
     n = len(l1_codes)
     for i, code in enumerate(l1_codes, start=1):
         try:
-            df = _call(pro.index_member_all, l1_code=code, is_new=is_new)
+            df = _call(pro.index_member_all, l1_code=code, is_new='Y')
             if df is not None and not df.empty:
                 frames.append(df)
                 _log(f"  members l1={code}: {len(df)} rows ({i}/{n})")
@@ -910,23 +917,22 @@ def fetch_sw_members(l1_codes: list[str], is_new: str = "Y") -> pd.DataFrame:
 
 
 def download_sw_members(
-    src: str = "SWS2021",
-    is_new: str = "Y",
+    src: str = "SW2021",
     classify_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Download Shenwan index members (per L1 industry) to <OUTPUT_DIR>/sw_members.parquet.
 
-    Iterates every L1 industry from sw_classify and fetches its members via
-    pro.index_member_all(l1_code=...). is_new='Y' (default) returns current
-    members only; 'N' includes historical in/out records.
+    Iterates every L1 industry from sw_classify and fetches ALL members via
+    pro.index_member_all(l1_code=...) — including historical in/out records.
+    Current membership is derived downstream from out_date (is_new is ignored).
     """
     if classify_df is None:
         classify_df = fetch_sw_classify(src=src)
     l1_codes = _sw_l1_codes(classify_df)
     if not l1_codes:
         raise RuntimeError("No L1 industry codes found in sw_classify")
-    _log(f"sw_members: fetching {len(l1_codes)} L1 industries (is_new={is_new})")
-    df = fetch_sw_members(l1_codes, is_new=is_new)
+    _log(f"sw_members: fetching {len(l1_codes)} L1 industries (all records)")
+    df = fetch_sw_members(l1_codes)
     if df.empty:
         raise RuntimeError("Failed to fetch sw members")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -1129,21 +1135,62 @@ def _cmd_sw_classify(args):
 
 
 def _cmd_dataset(args):
-    df = build_dataset(
-        kline_dir=args.kline_dir,
-        basic_path=args.basic_path,
-        adjust=args.adjust,
-        remove_st=not args.keep_st,
-        drop_ipo_days=args.drop_ipo_days,
-        start_date=args.start_date,
-        end_date=args.end_date,
-    )
-    out = os.path.join(OUTPUT_DIR, "dataset.parquet")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    df.to_parquet(out, index=False, engine="pyarrow")
-    print(f"Saved: {out}")
+    """Build the three standardized datasets: stock (per-month) + industry index
+    (per-month) + stock->industry mapping (single file)."""
+    kline_dir = args.kline_dir
+    s_ym = int(str(args.start_date).replace("-", "")[:6]) if args.start_date else 0
+    e_ym = int(str(args.end_date).replace("-", "")[:6]) if args.end_date else 999999
+
+    # month set = daily months ∩ sw_daily months
+    daily_months = {f.stem.split("-")[-1] for f in (Path(kline_dir) / "daily").glob("daily-*.parquet")}
+    sw_months = {f.stem.split("-")[-1] for f in (Path(kline_dir) / "sw_daily").glob("sw_daily-*.parquet")}
+    months = sorted(m for m in (daily_months & sw_months) if s_ym <= int(m) <= e_ym)
+    if not months:
+        raise FileNotFoundError(f"No overlapping daily/sw_daily months in {kline_dir}")
+    _log(f"dataset: {len(months)} months ({months[0]}~{months[-1]})")
+
+    out_root = Path(args.output_dir)
+    stock_dir = out_root / "stock"
+    industry_dir = out_root / "industry"
+    stock_dir.mkdir(parents=True, exist_ok=True)
+    industry_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. stock datasets (per month) — streaming, memory holds ~1 month
+    n_stock = 0
+    for ym, df in build_stock_dataset(kline_dir, months, basic_path=args.basic_path, adjust=args.adjust,
+                                      include_mkts=args.include_mkts):
+        df.to_parquet(stock_dir / f"stock-{ym}.parquet", index=False, engine="pyarrow")
+        n_stock += 1
+    _log(f"dataset: wrote {n_stock} stock month files")
+
+    # 2. industry index datasets (per month) — streaming
+    n_ind = 0
+    for ym, df in build_industry_dataset(kline_dir, months):
+        df.to_parquet(industry_dir / f"industry-{ym}.parquet", index=False, engine="pyarrow")
+        n_ind += 1
+    _log(f"dataset: wrote {n_ind} industry month files")
+
+    # 3. mapping (single file) — needs sw_classify + sw_members
+    classify_path = os.path.join(kline_dir, "sw_classify.parquet")
+    members_path = os.path.join(kline_dir, "sw_members.parquet")
+    if Path(classify_path).exists() and Path(members_path).exists():
+        cls = pd.read_parquet(classify_path, engine="pyarrow")
+        mem = pd.read_parquet(members_path, engine="pyarrow")
+        mapping = build_industry_mapping(cls, mem)
+        mapping.to_parquet(out_root / "industry_mapping.parquet", index=False, engine="pyarrow")
+        _log(f"dataset: wrote industry_mapping.parquet (rows={len(mapping)})")
+    else:
+        _log("dataset: sw_classify.parquet / sw_members.parquet missing — "
+             "run `python ts.py sw-classify` first; skipping mapping")
+
     if args.upload:
-        _upload(args)
+        from ms import upload_to_modelscope
+        upload_to_modelscope(
+            repo_id=args.repo_id,
+            local_dir=str(out_root),
+            path_in_repo="",
+            allow_patterns=["stock/*.parquet", "industry/*.parquet", "industry_mapping.parquet"],
+        )
 
 
 def main():
@@ -1204,8 +1251,6 @@ def main():
                    help="Classification version (SWS2021 default, or SWS2014)")
     p.add_argument("--no-members", action="store_true",
                    help="Skip index members (pro.index_member_all per L1)")
-    p.add_argument("--is-new", default="Y", choices=["Y", "N"],
-                   help="Members: Y=current only (default), N=include historical in/out")
     _add_upload(p, "sw_classify", "sw_classify.parquet")
     p.set_defaults(func=_cmd_sw_classify)
 
@@ -1213,12 +1258,14 @@ def main():
     p.add_argument("--kline-dir", default=OUTPUT_DIR,
                    help="Output root dir (contains daily/ daily_basic/ adj_factor/ stock_st/ subdirs)")
     p.add_argument("--basic-path", default="output/stock_basic.parquet")
-    p.add_argument("--adjust", default="none", choices=["none", "fore", "back"])
-    p.add_argument("--keep-st", action="store_true")
-    p.add_argument("--drop-ipo-days", type=int, default=20)
+    p.add_argument("--adjust", default="none", choices=["none", "fore", "back"],
+                   help="Adjustment for stock dataset: none / fore / back")
+    p.add_argument("--include-mkts", default="SH,SZ",
+                   help="Markets to include (comma-sep, default SH,SZ; omit BJ for new-third-board)")
     p.add_argument("--start-date", default=None)
     p.add_argument("--end-date", default=None)
-    _add_upload(p, "dataset", "dataset.parquet")
+    p.add_argument("--upload", action="store_true", help="Upload the three datasets to ModelScope")
+    p.add_argument("--repo-id", default="", help="ModelScope repo (required if --upload)")
     p.set_defaults(func=_cmd_dataset)
 
     p = sub.add_parser("upload", help="Upload output to ModelScope")
