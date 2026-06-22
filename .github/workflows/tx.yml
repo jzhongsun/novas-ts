@@ -4,7 +4,7 @@ name: tx daily data
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 11 * * *' # daily at 19:00 Beijing time (UTC+8)
+    - cron: '0 4,11 * * *' # daily at 12:00 and 19:00 Beijing time (UTC+8)
 
 permissions:
   contents: read
