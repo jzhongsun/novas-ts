@@ -1,0 +1,32 @@
+
+name: tx daily data
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 11 * * *' # daily at 19:00 Beijing time (UTC+8)
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: |
+        pip install pyarrow modelscope
+    - name: Download tx data
+      run: |
+        python tx.py ticks --from-stock-basic=data/stock_basic.parquet --calendar-path=data/calendar_dates.parquet  --upload --repo-id=jzhongsun/novas-tx
+      env:
+        TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+        TUSHARE_BASEURL: ${{ secrets.TUSHARE_BASEURL }}
+        MODELSCOPE_ACCESS_TOKEN: ${{ secrets.MODELSCOPE_ACCESS_TOKEN }}
