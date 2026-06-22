@@ -22,7 +22,7 @@ jobs:
         python-version: "3.12"
     - name: Install dependencies
       run: |
-        pip install httpx pyarrow modelscope
+        pip install httpx pandas numpy pyarrow modelscope
     - name: Download tx data
       run: |
         python tx.py ticks --from-stock-basic=data/stock_basic.parquet --calendar-path=data/calendar_dates.parquet  --upload --repo-id=jzhongsun/novas-tx
