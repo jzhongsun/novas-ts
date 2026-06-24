@@ -26,6 +26,7 @@ jobs:
     - name: Download tx data
       run: |
         python tx.py ticks --max-workers=20 --from-stock-basic=data/stock_basic.parquet --calendar-path=data/calendar_dates.parquet  --upload --repo-id=jzhongsun/novas-tx
+        python tx.py daily --from-stock-basic=data/stock_basic.parquet --calendar-path=data/calendar_dates.parquet  --upload --repo-id=jzhongsun/novas-tx
       env:
         TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
         TUSHARE_BASEURL: ${{ secrets.TUSHARE_BASEURL }}
