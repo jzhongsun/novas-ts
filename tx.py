@@ -14,12 +14,13 @@ Design:
   - Per-stock parquet files for crash safety + optional periodic combined saves.
   - Code conversion utility: tushare ts_code (000001.SZ) -> Tencent (sz000001).
 
-Subcommands: ticks, upload
+Subcommands: ticks, daily, upload
 
 Usage:
     python tx.py ticks --codes sh600519,sz000001
     python tx.py ticks --from-stock-basic ./output/stock_basic.parquet --max-workers 5
-    python tx.py ticks --from-stock-basic ./output/stock_basic.parquet --upload --repo-id myorg/tick-data
+    python tx.py ticks --upload --repo-id myorg/tick-data
+    python tx.py daily --upload --repo-id myorg/daily-data
 
 Setup:
     pip install httpx pandas pyarrow modelscope
@@ -47,8 +48,19 @@ except ImportError:
 
 
 OUTPUT_DIR = "./output/tick"
+DAILY_DIR = "./output/daily"
 MAX_RETRIES = 5
 PAGE_SIZE_HINT = 20  # pages with fewer rows are treated as the last page
+
+# gtimg real-time quote endpoint (one request returns ~80 stocks' daily bars)
+QUOTES_URL = "http://qt.gtimg.cn/q="
+QUOTES_BATCH = 80
+_QUOTE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0 Safari/537.36"
+    ),
+}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -387,30 +399,223 @@ def batch_fetch(
     return combined
 
 
+# ── daily OHLCV quotes (real-time snapshot → today's daily bar) ──────────────
+
+def _parse_quotes(text: str) -> list[dict]:
+    """Parse the gtimg real-time quote response into per-stock daily-bar rows.
+
+    Response format (one entry per stock, ';' separated)::
+
+        v_sh600000="1~浦发银行~600000~11.54~11.54~11.56~..."
+
+    Field indices (~ separated):
+      1=name, 3=close, 4=pre_close, 5=open, 6=volume(手),
+      30=date(YYYYMMDDHHMMSS), 31=change, 32=change_pct(%),
+      33=high, 34=low, 35="price/vol/amount(元)", 37=amount(万元),
+      38=turnover_rate(%), 39=pe, 43=amplitude(%),
+      44=circ_mv(亿), 45=total_mv(亿), 46=pb
+
+    Output units aligned to ts.py stock dataset: volume in shares, amount /
+    circ_mv / total_mv in yuan; turnover_rate / change_pct / amplitude in %.
+    """
+    def _f(fields: list[str], i: int) -> str | None:
+        if i >= len(fields):
+            return None
+        v = fields[i]
+        return v if v and v.strip() else None
+
+    def _float(fields, i, default=0.0) -> float:
+        v = _f(fields, i)
+        try:
+            return float(v) if v is not None else default
+        except ValueError:
+            return default
+
+    rows: list[dict] = []
+    for line in text.split(";"):
+        line = line.strip()
+        if not line.startswith("v_") or "=" not in line:
+            continue
+        var_name, _, data_str = line.partition("=")
+        f = data_str.strip().strip('"').split("~")
+        if len(f) < 35:
+            continue
+
+        api_code = var_name[2:]  # sh600000
+        if api_code[:2] in ("sh", "sz", "bj"):
+            code = api_code[:2].upper() + api_code[2:]   # SZ000001 (aligns ts.py)
+        else:
+            code = api_code.upper()
+
+        date_ts = _f(f, 30) or ""
+        date = date_ts[:8]  # YYYYMMDD
+
+        # amount (yuan): prefer composite field[35] "price/vol/amount",
+        # fall back to field[37] which is in 万元 (×1e4)
+        amount = 0.0
+        composite = _f(f, 35)
+        if composite and "/" in composite:
+            parts = composite.split("/")
+            if len(parts) >= 3:
+                amount = _float(parts, 2)
+        if amount == 0.0:
+            amount = _float(f, 37) * 1e4
+
+        try:
+            close = _float(f, 3)
+            pre_close = _float(f, 4, close)
+            open_ = _float(f, 5, close)
+            volume_lots = int(_float(f, 6))
+        except ValueError:
+            continue
+
+        rows.append({
+            "date":          date,
+            "code":          code,
+            "name":          _f(f, 1) or "",
+            "open":          open_,
+            "high":          _float(f, 33, close),
+            "low":           _float(f, 34, close),
+            "close":         close,
+            "pre_close":     pre_close,
+            "change":        _float(f, 31),
+            "change_pct":    _float(f, 32),
+            "volume":        volume_lots * 100,         # 手 -> shares
+            "amount":        amount,                    # yuan
+            "turnover_rate": _float(f, 38),
+            "pe":            _float(f, 39),
+            "pb":            _float(f, 46),
+            "amplitude":     _float(f, 43),
+            "circ_mv":       _float(f, 44) * 1e8,       # 亿 -> yuan
+            "total_mv":      _float(f, 45) * 1e8,       # 亿 -> yuan
+        })
+    return rows
+
+
+def fetch_daily(
+    codes: list[str],
+    output_dir: str = DAILY_DIR,
+    workers: int = 5,
+    batch_size: int = QUOTES_BATCH,
+) -> pd.DataFrame:
+    """Fetch today's daily OHLCV bar for all *codes* via the gtimg quote API.
+
+    The gtimg real-time quote endpoint returns the current day's OHLCV in a
+    single HTTP request per ~80 codes, so a full A-share sweep (~5000 stocks)
+    is ~65 requests.  Batches run concurrently (workers threads).
+
+    Output: ``<output_dir>/<YYYYMM>/daily_<YYYYMMDD>.parquet`` (one row per
+    stock).  Returns the combined DataFrame.
+    """
+    if not codes:
+        _log("fetch_daily: empty code list — nothing to do")
+        return pd.DataFrame()
+
+    today = _today()
+    out_path = Path(output_dir) / today[:6]
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    def _to_api(c: str) -> str:
+        """Tolerant conversion to gtimg api format (sh600519)."""
+        c = c.replace(".", "").replace("-", "").strip().lower()
+        if c[:2] in ("sh", "sz", "bj"):
+            return c
+        if c[:1] in ("0", "3"):
+            return "sz" + c
+        if c[:1] == "6":
+            return "sh" + c
+        return "sh" + c
+
+    api_codes = [_to_api(c) for c in codes]
+    batches = [api_codes[i:i + batch_size]
+               for i in range(0, len(api_codes), batch_size)]
+
+    def _fetch_batch(batch: list[str]) -> list[dict]:
+        url = QUOTES_URL + ",".join(batch)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with httpx.Client(timeout=10.0, headers=_QUOTE_HEADERS) as client:
+                    resp = client.get(url)
+                    resp.raise_for_status()
+                    return _parse_quotes(resp.text)
+            except (httpx.HTTPError, httpx.TimeoutException, ConnectionError) as e:
+                if attempt < MAX_RETRIES:
+                    time.sleep((2 ** attempt) + random.uniform(0, 1))
+                else:
+                    _log(f"fetch_daily: batch failed after {MAX_RETRIES} retries: {e}")
+                    return []
+        return []
+
+    _log(f"fetch_daily: {len(codes)} codes, {len(batches)} batches, workers={workers}")
+    all_rows: list[dict] = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_fetch_batch, b): b for b in batches}
+        done = 0
+        for fut in as_completed(futures):
+            all_rows.extend(fut.result())
+            done += 1
+            if done % 10 == 0 or done == len(batches):
+                _log(f"fetch_daily: {done}/{len(batches)} batches "
+                     f"({len(all_rows)} rows)")
+
+    if not all_rows:
+        _log("fetch_daily: no data — check market hours / network")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    df = df.drop_duplicates(subset=["code"]).reset_index(drop=True)
+
+    # compact dtypes (prices/ratios float32; mv float64 to preserve precision)
+    for c in ("open", "high", "low", "close", "pre_close", "change",
+              "change_pct", "turnover_rate", "pe", "pb", "amplitude"):
+        df[c] = df[c].astype("float32")
+    df["volume"] = df["volume"].astype("int64")
+    df["amount"] = df["amount"].astype("int64")
+    for c in ("circ_mv", "total_mv"):
+        df[c] = df[c].astype("float64")
+
+    out_file = out_path / f"daily_{today}.parquet"
+    df.to_parquet(out_file, index=False, engine="pyarrow")
+    _log(f"fetch_daily: saved {out_file} — {len(df)} rows, "
+         f"{df['code'].nunique()} stocks")
+    return df
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
+
+def _resolve_codes(args: argparse.Namespace) -> list[str]:
+    """Resolve stock codes from --codes, else --from-stock-basic (+--limit)."""
+    if args.codes:
+        return [c.strip() for c in args.codes.split(",") if c.strip()]
+    if not Path(args.from_stock_basic).exists():
+        raise SystemExit(
+            f"{args.from_stock_basic} not found — "
+            f"run 'python ts.py basic' first, or use --codes")
+    codes = codes_from_stock_basic(args.from_stock_basic)
+    if args.limit:
+        codes = codes[:args.limit]
+        _log(f"limited to first {args.limit} stocks")
+    return codes
+
+
+def _gate_trading_day(args: argparse.Namespace, cmd: str) -> bool:
+    """Return True if OK to proceed (trading day, or --force set)."""
+    if args.force:
+        _log(f"{cmd}: --force set — skipping trading-day check")
+        return True
+    if not is_trading_day(calendar_path=args.calendar_path):
+        _log(f"{cmd}: today is not a trading day — aborting "
+             f"(use --force to override)")
+        return False
+    return True
+
 
 def _cmd_ticks(args: argparse.Namespace) -> None:
     """Handler for the ``ticks`` subcommand."""
-    # trading-day gate (skipped with --force)
-    if args.force:
-        _log("ticks: --force set — skipping trading-day check")
-    elif not is_trading_day(calendar_path=args.calendar_path):
-        _log("ticks: today is not a trading day — aborting "
-             "(use --force to override)")
+    if not _gate_trading_day(args, "ticks"):
         return
 
-    if args.codes:
-        codes = [c.strip() for c in args.codes.split(",") if c.strip()]
-    else:
-        if not Path(args.from_stock_basic).exists():
-            raise SystemExit(
-                f"{args.from_stock_basic} not found — "
-                f"run 'python ts.py basic' first, or use --codes")
-        codes = codes_from_stock_basic(args.from_stock_basic)
-        if args.limit:
-            codes = codes[:args.limit]
-            _log(f"ticks: limited to first {args.limit} stocks")
-
+    codes = _resolve_codes(args)
     df = batch_fetch(
         codes=codes,
         output_dir=args.output_dir,
@@ -421,11 +626,9 @@ def _cmd_ticks(args: argparse.Namespace) -> None:
     )
 
     if df.empty:
-        _log("fetch: no data fetched — "
-             "verify codes, trading hours, and that stocks are not suspended")
+        _log("ticks: no data fetched — verify codes, trading hours, suspension")
     else:
-        _log(f"fetch: complete — {len(df)} ticks, "
-             f"{df['code'].nunique()} stocks")
+        _log(f"ticks: complete — {len(df)} ticks, {df['code'].nunique()} stocks")
 
     if args.upload:
         if not args.repo_id:
@@ -437,6 +640,37 @@ def _cmd_ticks(args: argparse.Namespace) -> None:
             local_dir=f"{args.output_dir}/{today[:6]}",
             path_in_repo=f"tick/{today[:6]}",
             allow_patterns=f"tick_{today}*.parquet",
+        )
+
+
+def _cmd_daily(args: argparse.Namespace) -> None:
+    """Handler for the ``daily`` subcommand (gtimg real-time OHLCV snapshot)."""
+    if not _gate_trading_day(args, "daily"):
+        return
+
+    codes = _resolve_codes(args)
+    df = fetch_daily(
+        codes=codes,
+        output_dir=args.output_dir,
+        workers=args.max_workers,
+        batch_size=args.batch_size,
+    )
+
+    if df.empty:
+        _log("daily: no data fetched — verify codes, trading hours, network")
+    else:
+        _log(f"daily: complete — {len(df)} rows, {df['code'].nunique()} stocks")
+
+    if args.upload:
+        if not args.repo_id:
+            raise SystemExit("--repo-id is required when --upload is set")
+        from ms import upload_to_modelscope
+        today = _today()
+        upload_to_modelscope(
+            repo_id=args.repo_id,
+            local_dir=f"{args.output_dir}/{today[:6]}",
+            path_in_repo=f"daily/{today[:6]}",
+            allow_patterns=f"daily_{today}*.parquet",
         )
 
 
@@ -453,7 +687,7 @@ def main() -> None:
         "--codes", default=None,
         help="Comma-separated Tencent-format codes, e.g. sh600519,sz000001")
     p.add_argument(
-        "--from-stock-basic", default="data/stock_basic.parquet",
+        "--from-stock-basic", default="output/stock_basic.parquet",
         help="Path to stock_basic.parquet (fetches all A-share stocks by default)")
     p.add_argument(
         "--limit", type=int, default=None,
@@ -486,6 +720,40 @@ def main() -> None:
         "--repo-id", default="",
         help="ModelScope repo (required if --upload)")
     p.set_defaults(func=_cmd_ticks)
+
+    p = sub.add_parser(
+        "daily", help="Fetch today's daily OHLCV bar via gtimg real-time quotes")
+    p.add_argument(
+        "--codes", default=None,
+        help="Comma-separated codes, e.g. sh600519,sz000001")
+    p.add_argument(
+        "--from-stock-basic", default="output/stock_basic.parquet",
+        help="Path to stock_basic.parquet (fetches all A-share stocks by default)")
+    p.add_argument(
+        "--limit", type=int, default=None,
+        help="Limit number of stocks when using --from-stock-basic")
+    p.add_argument(
+        "--max-workers", type=int, default=5,
+        help="Max concurrent batch-request threads (default 5)")
+    p.add_argument(
+        "--batch-size", type=int, default=QUOTES_BATCH,
+        help=f"Codes per gtimg request (default {QUOTES_BATCH})")
+    p.add_argument(
+        "--output-dir", default=DAILY_DIR,
+        help=f"Output directory for parquet files (default: {DAILY_DIR})")
+    p.add_argument(
+        "--calendar-path", default="data/calendar_dates.parquet",
+        help="Path to calendar_dates.parquet for trading-day check")
+    p.add_argument(
+        "--force", action="store_true",
+        help="Skip trading-day check (fetch even on non-trading days)")
+    p.add_argument(
+        "--upload", action="store_true",
+        help="Upload output to ModelScope after fetching")
+    p.add_argument(
+        "--repo-id", default="",
+        help="ModelScope repo (required if --upload)")
+    p.set_defaults(func=_cmd_daily)
 
     args = parser.parse_args()
     args.func(args)
