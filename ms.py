@@ -60,12 +60,12 @@ def upload_to_modelscope(
         print(f"No files matching {pats} in {local_dir}")
         return
 
-    print(f"Uploading {n_files} files to modelscope:{repo_id} ({path_in_repo})")
+    print(f"Uploading {n_files} files to modelscope:{repo_id} (path_in_repo={path_in_repo}) local_dir={local_dir}, allow_patterns={allow_patterns}")
     api.upload_folder(
         repo_id=repo_id,
         folder_path=local_dir,
         path_in_repo=path_in_repo,
-        allow_patterns=allow_patterns,
+        allow_patterns=pats,
         commit_message=f"Update {path_in_repo or 'root'} data ({n_files} files)",
         repo_type=repo_type,
         token=access_token,
