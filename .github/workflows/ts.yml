@@ -1,8 +1,16 @@
-
 name: ts daily data
 
 on:
   workflow_dispatch:
+    inputs:
+      start_date:
+        description: '数据开始日期 (格式: YYYYMMDD，留空则自动计算当月第一天)'
+        required: false
+        type: string
+      end_date:
+        description: '数据结束日期 (格式: YYYYMMDD，留空则自动计算当月最后一天)'
+        required: false
+        type: string
   schedule:
     - cron: '0 11 * * *' # daily at 19:00 Beijing time (UTC+8)
 
@@ -11,7 +19,6 @@ permissions:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
@@ -25,21 +32,44 @@ jobs:
         pip install tushare pyarrow modelscope
     - name: Download ts data
       run: |
-        YEAR=$(date +%Y)
-        MONTH=$(date +%m)
-        FIRST_DAY="${YEAR}${MONTH}01"
+        # 1. 优先获取手动输入的参数
+        INPUT_START="${{ github.event.inputs.start_date }}"
+        INPUT_END="${{ github.event.inputs.end_date }}"
 
-        if [ $MONTH -eq 12 ]; then
-            NEXT_MONTH_FIRST="${YEAR}-$((YEAR+1))-01-01"
+        # 2. 如果 start_date 为空，则自动计算当月第一天
+        if [ -z "$INPUT_START" ]; then
+            YEAR=$(date +%Y)
+            MONTH=$(date +%m)
+            FIRST_DAY="${YEAR}${MONTH}01"
         else
-            NEXT_MONTH_FIRST="${YEAR}-$(printf "%02d" $((10#$MONTH + 1)))-01"
+            FIRST_DAY="$INPUT_START"
         fi
 
-        LAST_DAY=$(date -d "$NEXT_MONTH_FIRST -1 day" +%Y%m%d)
+        # 3. 如果 end_date 为空，则自动计算当月最后一天
+        if [ -z "$INPUT_END" ]; then
+            YEAR=$(date +%Y)
+            MONTH=$(date +%m)
+            if [ $MONTH -eq 12 ]; then
+                NEXT_MONTH_FIRST="$((YEAR+1))-01-01"
+            else
+                NEXT_MONTH_FIRST="${YEAR}-$(printf "%02d" $((10#$MONTH + 1)))-01"
+            fi
+            LAST_DAY=$(date -d "$NEXT_MONTH_FIRST -1 day" +%Y%m%d)
+        else
+            LAST_DAY="$INPUT_END"
+        fi
+
+        # 打印当前运行使用的参数，方便在日志中核对
+        echo "=== Running Data Download ==="
+        echo "START_DATE: $FIRST_DAY"
+        echo "LAST_DAY: $LAST_DAY"
+        echo "============================="
+
+        # 4. 执行你的 Python 脚本（已将原本的 $LAST_DAY 替换到需要结束日期的参数中，如有需要可自行加到其他脚本后面）
         python ts.py basic --upload --repo-id=jzhongsun/novas-data-ts
-        python ts.py klines --start-date=$FIRST_DAY --upload --repo-id=jzhongsun/novas-data-ts --workers=4
+        python ts.py klines --start-date=$FIRST_DAY --end-date=$LAST_DAY --upload --repo-id=jzhongsun/novas-data-ts --workers=4
         python ts.py sw-classify --upload --repo-id=jzhongsun/novas-data-ts
-        python ts.py sw --start-date=$FIRST_DAY --upload --repo-id=jzhongsun/novas-data-ts --workers=2
+        python ts.py sw --start-date=$FIRST_DAY --end-date=$LAST_DAY --upload --repo-id=jzhongsun/novas-data-ts --workers=2
         python ts.py dataset --adjust=back --upload --repo-id=jzhongsun/novas-ds
       env:
         TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
