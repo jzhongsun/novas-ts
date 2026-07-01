@@ -45,7 +45,7 @@ def upload_to_modelscope(
         raise RuntimeError("Set MODELSCOPE_ACCESS_TOKEN env var")
 
     api = HubApi()
-    api.login(access_token=access_token)
+    api.login(access_token)
 
     # Count matching files for the log (api.upload_folder does the actual filter)
     if isinstance(allow_patterns, str):
